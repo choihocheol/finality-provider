@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	sdkmath "cosmossdk.io/math"
 	bbntypes "github.com/babylonchain/babylon/types"
@@ -23,6 +24,7 @@ import (
 	"github.com/babylonchain/finality-provider/finality-provider/proto"
 	"github.com/babylonchain/finality-provider/finality-provider/store"
 	fpkr "github.com/babylonchain/finality-provider/keyring"
+	"github.com/babylonchain/finality-provider/metrics"
 	"github.com/babylonchain/finality-provider/types"
 )
 
@@ -33,12 +35,6 @@ type FinalityProviderApp struct {
 	wg   sync.WaitGroup
 	quit chan struct{}
 
-	sentWg   sync.WaitGroup
-	sentQuit chan struct{}
-
-	eventWg   sync.WaitGroup
-	eventQuit chan struct{}
-
 	cc     clientcontroller.ClientController
 	kr     keyring.Keyring
 	fps    *store.FinalityProviderStore
@@ -48,6 +44,8 @@ type FinalityProviderApp struct {
 
 	fpManager   *FinalityProviderManager
 	eotsManager eotsmanager.EOTSManager
+
+	metrics *metrics.FpMetrics
 
 	createFinalityProviderRequestChan   chan *createFinalityProviderRequest
 	registerFinalityProviderRequestChan chan *registerFinalityProviderRequest
@@ -99,7 +97,9 @@ func NewFinalityProviderApp(
 		return nil, fmt.Errorf("failed to create keyring: %w", err)
 	}
 
-	fpm, err := NewFinalityProviderManager(fpStore, config, cc, em, logger)
+	fpMetrics := metrics.NewFpMetrics()
+
+	fpm, err := NewFinalityProviderManager(fpStore, config, cc, em, fpMetrics, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create finality-provider manager: %w", err)
 	}
@@ -113,9 +113,8 @@ func NewFinalityProviderApp(
 		input:                               input,
 		fpManager:                           fpm,
 		eotsManager:                         em,
+		metrics:                             fpMetrics,
 		quit:                                make(chan struct{}),
-		sentQuit:                            make(chan struct{}),
-		eventQuit:                           make(chan struct{}),
 		createFinalityProviderRequestChan:   make(chan *createFinalityProviderRequest),
 		registerFinalityProviderRequestChan: make(chan *registerFinalityProviderRequest),
 		finalityProviderRegisteredEventChan: make(chan *finalityProviderRegisteredEvent),
@@ -223,17 +222,63 @@ func (app *FinalityProviderApp) getFpPrivKey(fpPk []byte) (*btcec.PrivateKey, er
 	return record.PrivKey, nil
 }
 
+// SyncFinalityProviderStatus syncs the status of the finality-providers
+func (app *FinalityProviderApp) SyncFinalityProviderStatus() error {
+	latestBlock, err := app.cc.QueryBestBlock()
+	if err != nil {
+		return err
+	}
+
+	fps, err := app.fps.GetAllStoredFinalityProviders()
+	if err != nil {
+		return err
+	}
+
+	for _, fp := range fps {
+		vp, err := app.cc.QueryFinalityProviderVotingPower(fp.BtcPk, latestBlock.Height)
+		if err != nil {
+			// if error occured then the finality-provider is not registered in the Babylon chain yet
+			continue
+		}
+
+		if vp > 0 {
+			// voting power > 0 then set the status to ACTIVE
+			err = app.fps.SetFpStatus(fp.BtcPk, proto.FinalityProviderStatus_ACTIVE)
+			if err != nil {
+				return err
+			}
+		} else if vp == 0 {
+			// voting power == 0 then set status depending on previous status
+			switch fp.Status {
+			case proto.FinalityProviderStatus_CREATED:
+				// previous status is CREATED then set to REGISTERED
+				err = app.fps.SetFpStatus(fp.BtcPk, proto.FinalityProviderStatus_REGISTERED)
+				if err != nil {
+					return err
+				}
+			case proto.FinalityProviderStatus_ACTIVE:
+				// previous status is ACTIVE then set to INACTIVE
+				err = app.fps.SetFpStatus(fp.BtcPk, proto.FinalityProviderStatus_INACTIVE)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // Start starts only the finality-provider daemon without any finality-provider instances
 func (app *FinalityProviderApp) Start() error {
 	var startErr error
 	app.startOnce.Do(func() {
 		app.logger.Info("Starting FinalityProviderApp")
 
-		app.eventWg.Add(1)
+		app.wg.Add(3)
 		go app.eventLoop()
-
-		app.sentWg.Add(1)
 		go app.registrationLoop()
+		go app.metricsUpdateLoop()
 	})
 
 	return startErr
@@ -254,14 +299,6 @@ func (app *FinalityProviderApp) Stop() error {
 			stopErr = err
 			return
 		}
-
-		app.logger.Debug("Sent to Babylon loop stopped")
-		close(app.sentQuit)
-		app.sentWg.Wait()
-
-		app.logger.Debug("Stopping main eventLoop")
-		close(app.eventQuit)
-		app.eventWg.Wait()
 
 		app.logger.Debug("Stopping EOTS manager")
 		if err := app.eotsManager.Close(); err != nil {
@@ -346,6 +383,7 @@ func (app *FinalityProviderApp) handleCreateFinalityProviderRequest(req *createF
 	if err := app.fps.CreateFinalityProvider(chainPk, fpPk.MustToBTCPK(), req.description, req.commission, req.keyName, req.chainID, pop.BabylonSig, pop.BtcSig); err != nil {
 		return nil, fmt.Errorf("failed to save finality-provider: %w", err)
 	}
+	app.fpManager.metrics.RecordFpStatus(fpPk.MarshalHex(), proto.FinalityProviderStatus_CREATED)
 
 	app.logger.Info("successfully created a finality-provider",
 		zap.String("btc_pk", fpPk.MarshalHex()),
@@ -385,7 +423,7 @@ func CreateChainKey(keyringDir, chainID, keyName, backend, passphrase, hdPath st
 
 // main event loop for the finality-provider app
 func (app *FinalityProviderApp) eventLoop() {
-	defer app.eventWg.Done()
+	defer app.wg.Done()
 
 	for {
 		select {
@@ -407,6 +445,7 @@ func (app *FinalityProviderApp) eventLoop() {
 					zap.Error(err),
 				)
 			}
+			app.fpManager.metrics.RecordFpStatus(ev.btcPubKey.MarshalHex(), proto.FinalityProviderStatus_REGISTERED)
 
 			// return to the caller
 			ev.successResponse <- &RegisterFinalityProviderResponse{
@@ -415,7 +454,7 @@ func (app *FinalityProviderApp) eventLoop() {
 				TxHash:    ev.txHash,
 			}
 
-		case <-app.eventQuit:
+		case <-app.quit:
 			app.logger.Debug("exiting main event loop")
 			return
 		}
@@ -423,7 +462,7 @@ func (app *FinalityProviderApp) eventLoop() {
 }
 
 func (app *FinalityProviderApp) registrationLoop() {
-	defer app.sentWg.Done()
+	defer app.wg.Done()
 	for {
 		select {
 		case req := <-app.registerFinalityProviderRequestChan:
@@ -474,8 +513,33 @@ func (app *FinalityProviderApp) registrationLoop() {
 				// the registration
 				successResponse: req.successResponse,
 			}
-		case <-app.sentQuit:
+		case <-app.quit:
 			app.logger.Debug("exiting registration loop")
+			return
+		}
+	}
+}
+
+func (app *FinalityProviderApp) metricsUpdateLoop() {
+	defer app.wg.Done()
+
+	interval := app.config.Metrics.UpdateInterval
+	app.logger.Info("starting metrics update loop",
+		zap.Float64("interval seconds", interval.Seconds()))
+	updateTicker := time.NewTicker(interval)
+
+	for {
+		select {
+		case <-updateTicker.C:
+			fps, err := app.fps.GetAllStoredFinalityProviders()
+			if err != nil {
+				app.logger.Error("failed to get finality-providers from the store", zap.Error(err))
+				continue
+			}
+			app.metrics.UpdateFpMetrics(fps)
+		case <-app.quit:
+			updateTicker.Stop()
+			app.logger.Info("exiting metrics update loop")
 			return
 		}
 	}

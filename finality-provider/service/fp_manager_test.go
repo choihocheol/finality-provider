@@ -23,6 +23,7 @@ import (
 	"github.com/babylonchain/finality-provider/finality-provider/service"
 	fpstore "github.com/babylonchain/finality-provider/finality-provider/store"
 	"github.com/babylonchain/finality-provider/keyring"
+	"github.com/babylonchain/finality-provider/metrics"
 	"github.com/babylonchain/finality-provider/testutil"
 	"github.com/babylonchain/finality-provider/testutil/mocks"
 	"github.com/babylonchain/finality-provider/types"
@@ -121,7 +122,8 @@ func newFinalityProviderManagerWithRegisteredFp(t *testing.T, r *rand.Rand, cc c
 	fpStore, err := fpstore.NewFinalityProviderStore(fpdb)
 	require.NoError(t, err)
 
-	vm, err := service.NewFinalityProviderManager(fpStore, &fpCfg, cc, em, logger)
+	metricsCollectors := metrics.NewFpMetrics()
+	vm, err := service.NewFinalityProviderManager(fpStore, &fpCfg, cc, em, metricsCollectors, logger)
 	require.NoError(t, err)
 
 	// create registered finality-provider

@@ -1,8 +1,8 @@
 package service
 
 import (
-	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	fpcfg "github.com/babylonchain/finality-provider/finality-provider/config"
 	"github.com/babylonchain/finality-provider/finality-provider/proto"
 	"github.com/babylonchain/finality-provider/finality-provider/store"
+	"github.com/babylonchain/finality-provider/metrics"
 	"github.com/babylonchain/finality-provider/types"
 )
 
@@ -47,6 +48,8 @@ type FinalityProviderManager struct {
 	em     eotsmanager.EOTSManager
 	logger *zap.Logger
 
+	metrics *metrics.FpMetrics
+
 	criticalErrChan chan *CriticalError
 
 	quit chan struct{}
@@ -57,6 +60,7 @@ func NewFinalityProviderManager(
 	config *fpcfg.Config,
 	cc clientcontroller.ClientController,
 	em eotsmanager.EOTSManager,
+	metrics *metrics.FpMetrics,
 	logger *zap.Logger,
 ) (*FinalityProviderManager, error) {
 	return &FinalityProviderManager{
@@ -67,6 +71,7 @@ func NewFinalityProviderManager(
 		config:          config,
 		cc:              cc,
 		em:              em,
+		metrics:         metrics,
 		logger:          logger,
 		quit:            make(chan struct{}),
 	}, nil
@@ -89,7 +94,9 @@ func (fpm *FinalityProviderManager) monitorCriticalErr() {
 					zap.String("pk", criticalErr.fpBtcPk.MarshalHex()))
 				continue
 			}
-			if errors.Is(criticalErr.err, btcstakingtypes.ErrFpAlreadySlashed) {
+			// cannot use error.Is because the unwrapped error
+			// is not the expected error type
+			if strings.Contains(criticalErr.err.Error(), btcstakingtypes.ErrFpAlreadySlashed.Error()) {
 				fpm.setFinalityProviderSlashed(fpi)
 				fpm.logger.Debug("the finality-provider has been slashed",
 					zap.String("pk", criticalErr.fpBtcPk.MarshalHex()))
@@ -265,6 +272,7 @@ func (fpm *FinalityProviderManager) Stop() error {
 			stopErr = err
 			break
 		}
+		fpm.metrics.DecrementRunningFpGauge()
 	}
 
 	close(fpm.quit)
@@ -357,6 +365,7 @@ func (fpm *FinalityProviderManager) removeFinalityProviderInstance(fpPk *bbntype
 	}
 
 	delete(fpm.fpis, keyHex)
+	fpm.metrics.DecrementRunningFpGauge()
 	return nil
 }
 
@@ -380,7 +389,7 @@ func (fpm *FinalityProviderManager) addFinalityProviderInstance(
 		return fmt.Errorf("finality-provider instance already exists")
 	}
 
-	fpIns, err := NewFinalityProviderInstance(pk, fpm.config, fpm.fps, fpm.cc, fpm.em, passphrase, fpm.criticalErrChan, fpm.logger)
+	fpIns, err := NewFinalityProviderInstance(pk, fpm.config, fpm.fps, fpm.cc, fpm.em, fpm.metrics, passphrase, fpm.criticalErrChan, fpm.logger)
 	if err != nil {
 		return fmt.Errorf("failed to create finality-provider %s instance: %w", pkHex, err)
 	}
@@ -390,6 +399,7 @@ func (fpm *FinalityProviderManager) addFinalityProviderInstance(
 	}
 
 	fpm.fpis[pkHex] = fpIns
+	fpm.metrics.IncrementRunningFpGauge()
 
 	return nil
 }

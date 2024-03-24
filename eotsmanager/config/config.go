@@ -10,6 +10,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	"github.com/jessevdk/go-flags"
 
+	"github.com/babylonchain/finality-provider/metrics"
 	"github.com/babylonchain/finality-provider/util"
 )
 
@@ -34,12 +35,12 @@ var (
 )
 
 type Config struct {
-	LogLevel       string `long:"loglevel" description:"Logging level for all subsystems" choice:"trace" choice:"debug" choice:"info" choice:"warn" choice:"error" choice:"fatal"`
-	KeyringBackend string `long:"keyring-type" description:"Type of keyring to use"`
+	LogLevel       string          `long:"loglevel" description:"Logging level for all subsystems" choice:"trace" choice:"debug" choice:"info" choice:"warn" choice:"error" choice:"fatal"`
+	KeyringBackend string          `long:"keyring-type" description:"Type of keyring to use"`
+	RpcListener    string          `long:"rpclistener" description:"the listener for RPC connections, e.g., 127.0.0.1:1234"`
+	Metrics        *metrics.Config `group:"metrics" namespace:"metrics"`
 
-	DatabaseConfig *DBConfig
-
-	RpcListener string `long:"rpclistener" description:"the listener for RPC connections, e.g., 127.0.0.1:1234"`
+	DatabaseConfig *DBConfig `group:"dbconfig" namespace:"dbconfig"`
 }
 
 // LoadConfig initializes and parses the config using a config file and command
@@ -88,6 +89,14 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("the keyring backend should not be empty")
 	}
 
+	if cfg.Metrics == nil {
+		return fmt.Errorf("empty metrics config")
+	}
+
+	if err := cfg.Metrics.Validate(); err != nil {
+		return fmt.Errorf("invalid metrics config")
+	}
+
 	return nil
 }
 
@@ -117,6 +126,7 @@ func DefaultConfigWithHomePath(homePath string) *Config {
 		KeyringBackend: defaultKeyringBackend,
 		DatabaseConfig: DefaultDBConfigWithHomePath(homePath),
 		RpcListener:    defaultRpcListener,
+		Metrics:        metrics.DefaultEotsConfig(),
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)
